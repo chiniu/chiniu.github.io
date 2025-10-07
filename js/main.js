@@ -11,10 +11,7 @@ const EpdCmd = {
   SEND_DATA: 0x04,
   REFRESH:   0x05,
   SLEEP:     0x06,
-
-  SET_TIME:  0x20,
-
-  WRITE_IMG: 0x30, // v1.6
+  GET_CONFIG: 0x07,
 
   SET_CONFIG: 0x90,
   SYS_RESET:  0x91,
@@ -22,35 +19,52 @@ const EpdCmd = {
   CFG_ERASE:  0x99,
 };
 
+// Color mode commands (v1.5 protocol)
+const EpdColorModeCmd = {
+  BW:  16,  // Select B/W register (0x24)
+  RED: 19,  // Select RED register (0x26)
+};
+
+// Supported displays for our hardware
+// Note: 2.13" uses landscape (250x128), then rotates to portrait (128x250) for firmware
 const canvasSizes = [
-  { name: '1.54_152_152', width: 152, height: 152 },
-  { name: '1.54_200_200', width: 200, height: 200 },
-  { name: '2.13_212_104', width: 212, height: 104 },
-  { name: '2.13_250_122', width: 250, height: 122 },
-  { name: '2.66_296_152', width: 296, height: 152 },
-  { name: '2.9_296_128', width: 296, height: 128 },
-  { name: '2.9_384_168', width: 384, height: 168 },
-  { name: '3.5_384_184', width: 384, height: 184 },
-  { name: '3.7_416_240', width: 416, height: 240 },
-  { name: '3.97_800_480', width: 800, height: 480 },
-  { name: '4.2_400_300', width: 400, height: 300 },
-  { name: '5.79_792_272', width: 792, height: 272 },
-  { name: '5.83_600_448', width: 600, height: 448 },
-  { name: '5.83_648_480', width: 648, height: 480 },
-  { name: '7.5_640_384', width: 640, height: 384 },
-  { name: '7.5_800_480', width: 800, height: 480 },
-  { name: '7.5_880_528', width: 880, height: 528 },
-  { name: '10.2_960_640', width: 960, height: 640 },
-  { name: '10.85_1360_480', width: 1360, height: 480 },
-  { name: '11.6_960_640', width: 960, height: 640 },
-  { name: '4E_600_400', width: 600, height: 400 },
-  { name: '7.3E6', width: 480, height: 800 }
+  { name: '2.13_250_128', width: 250, height: 128, needsRotation: true },   // 2.13" Albubu (SSD1680) - landscape
+  { name: '4.2_400_300', width: 400, height: 300, needsRotation: false }    // 4.2" SORAFREE (SSD1619)
 ];
 
 function hex2bytes(hex) {
   for (var bytes = [], c = 0; c < hex.length; c += 2)
     bytes.push(parseInt(hex.substr(c, 2), 16));
   return new Uint8Array(bytes);
+}
+
+// Rotate ImageData 90° clockwise (for 2.13" landscape → portrait conversion)
+function rotateImageData90Clockwise(imageData) {
+  const srcWidth = imageData.width;
+  const srcHeight = imageData.height;
+  const srcData = imageData.data;
+
+  // After 90° clockwise rotation: new width = old height, new height = old width
+  const dstWidth = srcHeight;
+  const dstHeight = srcWidth;
+  const dstData = new Uint8ClampedArray(dstWidth * dstHeight * 4);
+
+  // Rotation mapping: (x, y) → (srcHeight - 1 - y, x)
+  for (let y = 0; y < srcHeight; y++) {
+    for (let x = 0; x < srcWidth; x++) {
+      const srcIdx = (y * srcWidth + x) * 4;
+      const dstX = srcHeight - 1 - y;
+      const dstY = x;
+      const dstIdx = (dstY * dstWidth + dstX) * 4;
+
+      dstData[dstIdx + 0] = srcData[srcIdx + 0]; // R
+      dstData[dstIdx + 1] = srcData[srcIdx + 1]; // G
+      dstData[dstIdx + 2] = srcData[srcIdx + 2]; // B
+      dstData[dstIdx + 3] = srcData[srcIdx + 3]; // A
+    }
+  }
+
+  return new ImageData(dstData, dstWidth, dstHeight);
 }
 
 function bytes2hex(data) {
@@ -98,29 +112,49 @@ async function write(cmd, data, withResponse = true) {
   return true;
 }
 
-async function writeImage(data, step = 'bw') {
-  const chunkSize = document.getElementById('mtusize').value - 2;
-  const interleavedCount = document.getElementById('interleavedcount').value;
-  const count = Math.round(data.length / chunkSize);
+// Send color mode command (v1.5 protocol)
+async function sendColorModeCommand(colorMode) {
+  return await write(EpdCmd.SEND_CMD, [colorMode]);
+}
+
+// Send image data in chunks (v1.5 protocol)
+async function writeImageData(data, isRedData = false) {
+  const chunkSize = Math.min(document.getElementById('mtusize').value, 16);
+  const interleavedCount = parseInt(document.getElementById('interleavedcount').value);
+  const count = Math.ceil(data.length / chunkSize);
   let chunkIdx = 0;
   let noReplyCount = interleavedCount;
 
+  const dataType = isRedData ? 'RED' : 'B/W';
+  addLog(`Sending ${data.length} bytes of ${dataType} data in ${count} chunks...`);
+
   for (let i = 0; i < data.length; i += chunkSize) {
     let currentTime = (new Date().getTime() - startTime) / 1000.0;
-    setStatus(`${step == 'bw' ? '黑白' : '颜色'}块: ${chunkIdx + 1}/${count + 1}, 总用时: ${currentTime}s`);
-    const payload = [
-      (step == 'bw' ? 0x0F : 0x00) | (i == 0 ? 0x00 : 0xF0),
-      ...data.slice(i, i + chunkSize),
-    ];
+    setStatus(`${dataType}数据块: ${chunkIdx + 1}/${count}, 总用时: ${currentTime.toFixed(1)}s`);
+
+    const chunk = data.slice(i, i + chunkSize);
+
+    // Use write-with-response for reliable delivery
     if (noReplyCount > 0) {
-      await write(EpdCmd.WRITE_IMG, payload, false);
+      await write(EpdCmd.SEND_DATA, chunk, false);
       noReplyCount--;
     } else {
-      await write(EpdCmd.WRITE_IMG, payload, true);
+      await write(EpdCmd.SEND_DATA, chunk, true);
       noReplyCount = interleavedCount;
     }
+
+    // Progress logging every 50 chunks
+    if ((chunkIdx + 1) % 50 === 0) {
+      addLog(`已发送 ${chunkIdx + 1}/${count} 块 [${dataType}]`);
+    }
+
+    // Small delay for firmware processing (RED data needs more time)
+    await new Promise(resolve => setTimeout(resolve, isRedData ? 10 : 5));
+
     chunkIdx++;
   }
+
+  addLog(`${dataType} 数据发送完成！`);
 }
 
 async function setDriver() {
@@ -128,24 +162,7 @@ async function setDriver() {
   await write(EpdCmd.INIT, document.getElementById("epddriver").value);
 }
 
-async function syncTime(mode) {
-  if (mode === 2) {
-    if (!confirm('提醒：时钟模式目前使用全刷实现，仅供体验，不建议长期开启，是否继续?')) return;
-  }
-  const timestamp = new Date().getTime() / 1000;
-  const data = new Uint8Array([
-    (timestamp >> 24) & 0xFF,
-    (timestamp >> 16) & 0xFF,
-    (timestamp >> 8) & 0xFF,
-    timestamp & 0xFF,
-    -(new Date().getTimezoneOffset() / 60),
-    mode
-  ]);
-  if (await write(EpdCmd.SET_TIME, data)) {
-    addLog("时间已同步！");
-    addLog("屏幕刷新完成前请不要操作。");
-  }
-}
+// Removed: Calendar/Clock mode not supported in our design
 
 async function clearScreen() {
   if (confirm('确认清除屏幕内容?')) {
@@ -184,25 +201,51 @@ async function sendimg() {
   const status = document.getElementById("status");
   status.parentElement.style.display = "block";
 
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  // Get canvas size config to check if rotation is needed
+  const selectedSizeName = document.getElementById('canvasSize').value;
+  const selectedSizeConfig = canvasSizes.find(size => size.name === selectedSizeName);
+
+  let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+  // Rotate 2.13" display 90° clockwise (250x128 landscape → 128x250 portrait)
+  if (selectedSizeConfig && selectedSizeConfig.needsRotation) {
+    addLog("旋转图像 90° (250x128 → 128x250)...");
+    imageData = rotateImageData90Clockwise(imageData);
+  }
+
   const processedData = processImageData(imageData, ditherMode);
 
   updateButtonStatus(true);
 
-  if (ditherMode === 'fourColor') {
-    await writeImage(processedData, 'color');
-  } else if (ditherMode === 'threeColor') {
+  // Use v1.5 protocol: send color mode command, then data chunks
+  if (ditherMode === 'threeColor') {
+    // Three-color mode: B/W + RED channels
     const halfLength = Math.floor(processedData.length / 2);
-    await writeImage(processedData.slice(0, halfLength), 'bw');
-    await writeImage(processedData.slice(halfLength), 'red');
+    const bwData = processedData.slice(0, halfLength);
+    const redData = processedData.slice(halfLength);
+
+    // Send B/W channel
+    addLog("发送黑白通道数据...");
+    await sendColorModeCommand(EpdColorModeCmd.BW);
+    await writeImageData(bwData, false);
+
+    // Send RED channel
+    addLog("发送红色通道数据...");
+    await sendColorModeCommand(EpdColorModeCmd.RED);
+    await writeImageData(redData, true);
   } else if (ditherMode === 'blackWhiteColor') {
-    await writeImage(processedData, 'bw');
+    // Black/White only mode
+    addLog("发送黑白数据...");
+    await sendColorModeCommand(EpdColorModeCmd.BW);
+    await writeImageData(processedData, false);
   } else {
     addLog("当前固件不支持此颜色模式。");
     updateButtonStatus();
     return;
   }
 
+  // Refresh display
+  addLog("刷新显示...");
   await write(EpdCmd.REFRESH);
   updateButtonStatus();
 
@@ -265,8 +308,6 @@ function updateButtonStatus(forceDisabled = false) {
   const status = forceDisabled ? 'disabled' : (connected ? null : 'disabled');
   document.getElementById("reconnectbutton").disabled = (gattServer == null || gattServer.connected) ? 'disabled' : null;
   document.getElementById("sendcmdbutton").disabled = status;
-  document.getElementById("calendarmodebutton").disabled = status;
-  document.getElementById("clockmodebutton").disabled = status;
   document.getElementById("clearscreenbutton").disabled = status;
   document.getElementById("sendimgbutton").disabled = status;
   document.getElementById("setDriverbutton").disabled = status;
